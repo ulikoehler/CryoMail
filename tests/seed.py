@@ -56,7 +56,7 @@ def connect(host: str, port: int, user: str, pw: str) -> imaplib.IMAP4:
             m = imaplib.IMAP4(host, port)
             if m.login(user, pw)[0] == "OK":
                 return m
-        except OSError:
+        except Exception:
             pass
         time.sleep(1)
     raise SystemExit("cannot connect/login to seed server")

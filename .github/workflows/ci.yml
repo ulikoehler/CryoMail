@@ -46,7 +46,7 @@ jobs:
                   try:
                       imaplib.IMAP4('localhost', port).logout()
                       break
-                  except OSError:
+                  except Exception:
                       time.sleep(1)
               else:
                   raise SystemExit(f'IMAP on {port} never came up')
