@@ -1,0 +1,22 @@
+# Systemd unit for scheduled email backups.
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp cryomail.service cryomail.timer ~/.config/systemd/user/
+#   cp your-backup.ini ~/.config/cryomail.ini  (chmod 600!)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now cryomail.timer
+#
+# Keep the password out of the ini file: use an EnvironmentFile or
+# `systemd-creds`, or rely on the interactive prompt being unavailable
+# (non-tty) by exporting CRYOMAIL_PASSWORD via an EnvironmentFile:
+#   EnvironmentFile=%h/.config/cryomail.env
+
+[Unit]
+Description=Incremental IMAP email backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cryomail -c %h/.config/cryomail.ini
+# EnvironmentFile=%h/.config/cryomail.env
+Nice=10
+IOSchedulingClass=idle
