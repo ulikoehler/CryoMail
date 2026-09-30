@@ -23,6 +23,9 @@ downloading only what changed.
 - **Parallel**: a pool of worker threads, each holding its own IMAP
   connection, downloads message batches (`--jobs` / `--batch-size`). A
   single large INBOX parallelizes across workers.
+- **Structured restore**: a companion binary, `cryomail-restore`, uploads a
+  backup back onto an IMAP server — recreating the mailbox hierarchy and
+  preserving flags and `INTERNALDATE`, incrementally.
 - **Restic integration**: optional `restic backup` after each sync for
   deduplicated, versioned, optionally off-site snapshots.
 - **Backup semantics**: messages deleted on the server are kept locally.
@@ -58,7 +61,7 @@ trusted.
 ```sh
 git clone https://github.com/ulikoehler/CryoMail.git
 cd CryoMail
-cargo build --release          # binary: target/release/cryomail
+cargo build --release          # binaries: target/release/cryomail{,-restore}
 # or install into ~/.cargo/bin:
 cargo install --path .
 ```
@@ -178,12 +181,71 @@ and a deduplicated, versioned, restorable restic history.
 
 ## Restoring
 
+### `cryomail-restore` — upload a backup to an IMAP server
+
+> **Warning:** unlike `cryomail`, this tool **writes** to the IMAP server.
+> It creates mailboxes and appends messages. Point it at the *destination*
+> account you want to populate — never at your production account unless
+> that is exactly what you intend.
+
+```sh
+cryomail-restore --host imap.new.example.com -u me@new.example.com \
+    -i ./mail-backup -j 4
+# or with a config file (same sections as backup, plus [restore]):
+cryomail-restore -c restore.ini
+```
+
+What it does:
+
+1. Discovers every maildir under `--input` (nested maildirs included, e.g.
+   `Work/Projects/2024`); stale `*.stale-uv*` folders are skipped.
+2. Maps the directory tree back to mailbox names using the *destination*
+   server's hierarchy delimiter, optionally under `--prefix` (e.g.
+   `Restored.INBOX`).
+3. `CREATE`s missing mailboxes — including parent hierarchy nodes — as
+   needed.
+4. `APPEND`s each message with its saved flags (`\Seen`, `\Flagged`,
+   `\Answered`, `\Draft`, `\Deleted`, plus keyword flags) and its original
+   `INTERNALDATE`, so restored timestamps match the source.
+5. Tracks progress in `restore-state.json` files inside each local folder:
+   already-uploaded messages are skipped on re-run, making restores
+   resumable and idempotent. If the destination mailbox's `UIDVALIDITY`
+   changed since a previous restore, its messages are re-uploaded.
+
+#### Restore options
+
+`cryomail-restore` accepts the same `[imap]` connection options as
+`cryomail` (`--host`, `--port`, `-u`, `-p`, `--tls`, `--tls-insecure`),
+plus:
+
+| Flag | ini key | Default | Description |
+|---|---|---|---|
+| `-i, --input DIR` | `[restore] input` | required | backup directory to restore from |
+| `-j, --jobs N` | `[restore] jobs` | `4` | parallel IMAP connections |
+| `--prefix NAME` | `[restore] prefix` | — | restore under this parent mailbox |
+| `-f, --folder NAME` | `[restore] folders` (comma-sep) | all | restrict to named mailboxes (repeatable) |
+| `--batch-size N` | `[restore] batch_size` | `64` | messages per worker chunk |
+| `--dry-run` | — | off | plan only: create nothing, upload nothing |
+
+A minimal `restore.ini`:
+
+```ini
+[imap]
+host = imap.new.example.com
+username = me@new.example.com
+
+[restore]
+input = ./mail-backup
+jobs = 4
+; prefix = Restored
+```
+
+### Other ways to read a backup
+
 - **Plain files**: maildir files are RFC822 messages — open `<out>/<folder>`
   in any maildir-capable client, or copy `new/`+`cur/` files wherever needed.
 - **Restic**: `restic -r <repo> restore latest --target /tmp/restore` or
   `restic -r <repo> mount /mnt` to browse snapshots.
-- **Back to a server**: use any IMAP upload tool (`offlineimap`-style sync,
-  `imapsync`, or `doveadm import`) pointing at the maildir.
 
 ## Examples
 
@@ -217,6 +279,34 @@ Cron equivalent:
 ```sh
 cargo test     # unit tests (query whitelist, maildir naming, path sanitize)
 cargo clippy   # lint-clean
+```
+
+### Integration tests (CI)
+
+`.github/workflows/ci.yml` runs a full end-to-end cycle on every push:
+
+1. Two throwaway [GreenMail](https://greenmail-mail-test.github.io/greenmail/)
+   IMAP containers (source + destination).
+2. `tests/seed.py` creates 8 mailboxes (nested, incl. modified-UTF-7 names)
+   and generates **1000 messages** with assorted flags on the source.
+3. `cryomail` backs the source up to a local maildir; a second run is
+   asserted to be a no-op.
+4. `cryomail-restore` uploads everything to the destination; a second run
+   is asserted to upload nothing.
+5. `tests/verify.py` compares source and destination: mailbox hierarchy,
+   per-folder message count, body SHA-256 multiset, and flags (excluding
+   session-scoped `\Recent`).
+
+To run it locally:
+
+```sh
+docker run -d --name gm-src -p 3143:3143 -e 'GREENMAIL_OPTS=-Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.users=test:test@localhost' greenmail/standalone:2.1.4
+docker run -d --name gm-dst -p 4143:3143 -e 'GREENMAIL_OPTS=-Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.users=test:test@localhost' greenmail/standalone:2.1.4
+python3 tests/seed.py localhost 3143 test test 1000
+./target/release/cryomail --host localhost --port 3143 -u test -p test -o ./e2e-backup --tls none
+./target/release/cryomail-restore --host localhost --port 4143 -u test -p test -i ./e2e-backup --tls none
+python3 tests/verify.py localhost 3143 localhost 4143 test test
+docker rm -f gm-src gm-dst
 ```
 
 ## License

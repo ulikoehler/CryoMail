@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build, test, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --verbose
+      - run: cargo build --release --bins
+
+  e2e-restore:
+    name: E2E backup → restore (1000 mails)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start source and destination IMAP servers (GreenMail)
+        run: |
+          docker run -d --name gm-src -p 3143:3143 \
+            -e GREENMAIL_OPTS='-Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.users=test:test@localhost' \
+            greenmail/standalone:2.1.4
+          docker run -d --name gm-dst -p 4143:3143 \
+            -e GREENMAIL_OPTS='-Dgreenmail.setup.test.imap -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.users=test:test@localhost' \
+            greenmail/standalone:2.1.4
+          python3 - <<'EOF'
+          import imaplib, time
+          for port in (3143, 4143):
+              for _ in range(60):
+                  try:
+                      imaplib.IMAP4('localhost', port).logout()
+                      break
+                  except OSError:
+                      time.sleep(1)
+              else:
+                  raise SystemExit(f'IMAP on {port} never came up')
+          EOF
+
+      - name: Build binaries
+        run: cargo build --release --bins
+
+      - name: Seed 1000 test messages on source
+        run: python3 tests/seed.py localhost 3143 test test 1000
+
+      - name: Backup source → local maildir
+        run: |
+          ./target/release/cryomail --host localhost --port 3143 \
+            -u test -p test -o ./e2e-backup --tls none -j 4
+
+      - name: Incremental backup must be a no-op
+        run: |
+          ./target/release/cryomail --host localhost --port 3143 \
+            -u test -p test -o ./e2e-backup --tls none -j 4 2>&1 | tee /tmp/b2.log
+          grep -q "0 to fetch" /tmp/b2.log
+
+      - name: Restore maildir → destination server
+        run: |
+          ./target/release/cryomail-restore --host localhost --port 4143 \
+            -u test -p test -i ./e2e-backup --tls none -j 4
+
+      - name: Verify all messages identical
+        run: python3 tests/verify.py localhost 3143 localhost 4143 test test
+
+      - name: Second restore must be incremental no-op
+        run: |
+          ./target/release/cryomail-restore --host localhost --port 4143 \
+            -u test -p test -i ./e2e-backup --tls none -j 4 2>&1 | tee /tmp/r2.log
+          grep -q "0 uploaded" /tmp/r2.log
+
+      - name: Verify again after second restore
+        run: python3 tests/verify.py localhost 3143 localhost 4143 test test
+
+      - name: Cleanup containers
+        if: always()
+        run: docker rm -f gm-src gm-dst || true
